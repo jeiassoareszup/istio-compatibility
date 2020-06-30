@@ -1,0 +1,347 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: istio-version
+  labels:
+    app: istio-version
+    version: v1
+    circle: circle-1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: istio-version
+  template:
+    metadata:
+      labels:
+        app: istio-version
+        version: v1
+        circle: circle-1
+    spec:
+      containers:
+        - name: istio-version
+          image: jeias/istio-verions:latest
+          ports:
+            - name: metrics1-port
+              containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: istio-service
+spec:
+  selector:
+    app: istio-version
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: apps/v1 # for versions before 1.9.0 use apps/v1beta2
+kind: Deployment
+metadata:
+  name: nginx
+  labels:
+    app: nginx
+spec:
+  selector:
+    matchLabels:
+      app: nginx
+  replicas: 1 # tells deployment to run 2 pods matching the template
+  template: # create pods using pod definition in this template
+    metadata:
+      # unlike pod-nginx.yaml, the name is not included in the meta data as a unique name is
+      # generated from the deployment name
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: confnginx
+---
+apiVersion: v1
+data:
+  nginx.conf: |-
+    user       nginx;
+    worker_processes  5;
+    worker_rlimit_nofile 8192;
+    events {
+        worker_connections  4096;
+    }
+    http {
+        index    index.html index.htm index.php;
+        default_type application/octet-stream;
+        log_format main  '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" '
+                        '"$http_user_agent" "$http_x_forwarded_for"';
+        sendfile on;
+        tcp_nopush   on;
+        server_names_hash_bucket_size 128;
+
+        server {
+            listen 80;
+            location / {
+                proxy_http_version 1.1;
+                proxy_pass http://istio-service:8080;
+            }
+        }
+    }
+kind: ConfigMap
+metadata:
+  name: confnginx
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: nginx
+  name: nginx
+spec:
+  externalTrafficPolicy: Cluster
+  ports:
+    - nodePort: 30803
+      port: 80
+      protocol: TCP
+      targetPort: 80
+  selector:
+    app: nginx
+  sessionAffinity: None
+  type: LoadBalancer
+status:
+  loadBalancer: {}
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: istio-version
+spec:
+  hosts:
+    - istio-service
+  http:
+    - route:
+        - destination:
+            host: istio-service
+            subset: v1
+          headers:
+            request:
+              set:
+                x-circle-source: f5d23a57-5607-4306-9993-477e1598cc2a
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: DestinationRule
+metadata:
+  name: istio-version
+spec:
+  host: istio-service
+  subsets:
+    - labels:
+        version: v1
+      name: v1
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |-
+    global:
+      scrape_interval: 15s
+      scrape_timeout: 10s
+      evaluation_interval: 1m
+    scrape_configs:
+    - job_name: istio-mesh
+      scrape_interval: 15s
+      scrape_timeout: 10s
+      metrics_path: /metrics
+      scheme: http
+      kubernetes_sd_configs:
+      - role: endpoints
+        namespaces:
+          names:
+          - istio-system #The namespace where your Istio is installed
+      relabel_configs:
+      - source_labels: [__meta_kubernetes_service_name, __meta_kubernetes_endpoint_port_name]
+        separator: ;
+        regex: istio-telemetry;prometheus
+        replacement: $1
+        action: keep
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-deployment
+  labels:
+    app: prometheus-server
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus-server
+  template:
+    metadata:
+      labels:
+        app: prometheus-server
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.12.0
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.retention.time=7d"
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: prometheus-config-volume
+              mountPath: /etc/prometheus/
+      volumes:
+        - name: prometheus-config-volume
+          configMap:
+            defaultMode: 420
+            name: prometheus-config
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - services
+      - endpoints
+      - pods
+    verbs: ["get", "list", "watch"]
+  - apiGroups:
+      - extensions
+    resources:
+      - ingresses
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: monitoring
+---
+# Configuration for request count metric instance
+apiVersion: config.istio.io/v1alpha2
+kind: instance
+metadata:
+  name: charlesrequesttotal
+  namespace: istio-system
+spec:
+  compiledTemplate: metric
+  params:
+    value: "1"
+    dimensions:
+      source: source.workload.name | "unknown"
+      destination_pod: destination.workload.name | "unknown"
+      destination_host: request.host | "unknown"
+      destination_component: destination.labels["app"] | "unknown"
+      circle_id: request.headers["x-circle-id"] | "unknown"
+      circle_source: request.headers["x-circle-source"] | "unknown"
+      response_status: response.code | 200
+    monitoredResourceType: '"UNSPECIFIED"'
+---
+# Configuration for response duration metric instance
+apiVersion: config.istio.io/v1alpha2
+kind: instance
+metadata:
+  name: charlesrequestduration
+  namespace: istio-system
+spec:
+  compiledTemplate: metric
+  params:
+    value: response.duration | "0ms"
+    dimensions:
+      source: source.workload.name | "unknown"
+      destination_pod: destination.workload.name | "unknown"
+      destination_host: request.host | "unknown"
+      destination_component: destination.labels["app"] | "unknown"
+      circle_id: request.headers["x-circle-id"] | "unknown"
+      circle_source: request.headers["x-circle-source"] | "unknown"
+      response_status: response.code | 200
+    monitoredResourceType: '"UNSPECIFIED"'
+---
+# Configuration for a Prometheus handler
+apiVersion: config.istio.io/v1alpha2
+kind: handler
+metadata:
+  name: charleshandler
+  namespace: istio-system
+spec:
+  compiledAdapter: prometheus
+  params:
+    metrics:
+      - name: charles_request_total # Prometheus metric name
+        instance_name: charlesrequesttotal.instance.istio-system
+        kind: COUNTER
+        label_names:
+          - source
+          - destination_pod
+          - destination_host
+          - destination_component
+          - circle_id
+          - circle_source
+          - response_status
+      - name: charles_request_duration_seconds # Prometheus metric name
+        instance_name: charlesrequestduration.instance.istio-system
+        kind: DISTRIBUTION
+        label_names:
+          - source
+          - destination_pod
+          - destination_host
+          - destination_component
+          - circle_id
+          - circle_source
+          - response_status
+        buckets:
+          explicit_buckets:
+            bounds:
+              - 0.01
+              - 0.025
+              - 0.05
+              - 0.1
+              - 0.25
+              - 0.5
+              - 0.75
+              - 1
+              - 2.5
+              - 5
+              - 10
+---
+# Rule to send metric instances to a Prometheus handler
+apiVersion: config.istio.io/v1alpha2
+kind: rule
+metadata:
+  name: charlesprom
+  namespace: istio-system
+spec:
+  actions:
+    - handler: charleshandler
+      instances:
+        - charlesrequesttotal
+        - charlesrequestduration
+
